@@ -4,12 +4,28 @@ import 'package:hive_flutter/hive_flutter.dart';
 import 'package:intl/intl.dart';
 import 'dart:async';
 
+class DateTimeAdapter extends TypeAdapter<DateTime> {
+  @override
+  final int typeId = 100;
+
+  @override
+  DateTime read(BinaryReader reader) {
+    return DateTime.parse(reader.readString()).toUtc();
+  }
+
+  @override
+  void write(BinaryWriter writer, DateTime obj) {
+    writer.writeString(obj.toUtc().toIso8601String());
+  }
+}
+
 void main() async {
   await Hive.initFlutter();
-  await Hive.openBox('cashierBox'); // Stores current day's records
-  await Hive.openBox('incomeDataBox'); // Stores aggregated income data by date
-  await Hive.openBox('historicalRecordsBox'); // Stores historical records
-  await Hive.openBox('settingsBox'); // Stores price settings and last cleared date
+  Hive.registerAdapter(DateTimeAdapter());
+  await Hive.openBox('cashierBox');
+  await Hive.openBox('incomeDataBox');
+  await Hive.openBox('historicalRecordsBox');
+  await Hive.openBox('settingsBox');
   runApp(CashieringApp());
 }
 
@@ -20,7 +36,6 @@ class CashieringApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData.light().copyWith(
         primaryColor: const Color.fromARGB(255, 0, 0, 0),
-        scaffoldBackgroundColor: Colors.white,
       ),
       title: 'CR Cashiering App',
       home: CashieringHomePage(),
@@ -42,57 +57,94 @@ class _CashieringHomePageState extends State<CashieringHomePage> {
   DateTime? _toDate;
   String? _selectedCategory;
 
+  /* ========== DATE UTILITIES ========== */
+  DateTime _normalizeDate(DateTime date) {
+    return DateTime(date.year, date.month, date.day);
+  }
+
+  bool _isSameDay(DateTime a, DateTime b) {
+    return _normalizeDate(a).isAtSameMomentAs(_normalizeDate(b));
+  }
+
+  bool _isDateInRange(DateTime date, DateTime start, DateTime end) {
+    final normalizedDate = _normalizeDate(date);
+    final normalizedStart = _normalizeDate(start);
+    final normalizedEnd = _normalizeDate(end).add(const Duration(days: 1));
+    return normalizedDate.isAfter(normalizedStart.subtract(const Duration(days: 1))) && 
+           normalizedDate.isBefore(normalizedEnd);
+  }
+
+  /* ========== DEBUG UTILITY ========== */
+  void _printAllRecords() {
+    debugPrint('\n=== CURRENT RECORDS ===');
+    cashierBox.values.forEach((r) => debugPrint(
+      '${r['type']} - ₱${r['amount']} - ${r['date']}'
+    ));
+    
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Printed records to console'), duration: Duration(seconds: 1))
+    );
+  }
+
   @override
   void initState() {
     super.initState();
     _checkAndClearRecordsForNewDay();
   }
 
+  /* ========== RESET LOGIC ========== */
   void _checkAndClearRecordsForNewDay() {
-    final now = DateTime.now();
-    final lastClearedDate = settingsBox.get('lastClearedDate', defaultValue: '');
+    final now = _normalizeDate(DateTime.now());
+    final lastClearedDate = settingsBox.get('lastClearedDate');
 
-    final todayDate = DateFormat('yyyy-MM-dd').format(now);
-
-    if (lastClearedDate != todayDate) {
-      // A new day has started
+    if (lastClearedDate == null || !_isSameDay(DateTime.parse(lastClearedDate), now)) {
       _moveRecordsToHistoricalBox();
       _moveDailyIncomeToSeparateRecord();
-      cashierBox.clear(); // Clear cashier records
-      settingsBox.put('lastClearedDate', todayDate); // Update last cleared date
+      cashierBox.clear();
+      settingsBox.put('lastClearedDate', now.toIso8601String());
     }
   }
 
-  void _moveRecordsToHistoricalBox() {
-    final now = DateTime.now();
-    final dateKey = DateFormat('yyyy-MM-dd').format(now);
-
-    // Move all records from cashierBox to historicalRecordsBox
-    final records = cashierBox.values.toList();
-    for (var record in records) {
-      historicalRecordsBox.add({
-        ...record,
-        'date': dateKey, // Ensure the date is stored correctly
-      });
-    }
-  }
+ void _moveRecordsToHistoricalBox() {
+  cashierBox.values.forEach((record) {
+    historicalRecordsBox.add(Map.from(record));
+  });
+}
 
   void _moveDailyIncomeToSeparateRecord() {
-    final now = DateTime.now();
-    final dateKey = DateFormat('yyyy-MM-dd').format(now);
-
-    // Calculate total income for the day
+    final todayKey = DateFormat('yyyy-MM-dd').format(_normalizeDate(DateTime.now()));
     double dailyIncome = cashierBox.values.fold(0.0, (sum, record) {
-      if (record is Map && record.containsKey('amount')) {
+      return sum + (record['amount'] ?? 0.0);
+    });
+    if (dailyIncome > 0) incomeDataBox.put(todayKey, dailyIncome);
+  }
+
+  /* ========== INCOME CALCULATION ========== */
+  double _calculateIncomeForRange(DateTime fromDate, DateTime toDate, String category) {
+    double totalIncome = 0.0;
+    final normalizedFrom = _normalizeDate(fromDate);
+    final normalizedTo = _normalizeDate(toDate).add(const Duration(days: 1));
+
+    totalIncome += historicalRecordsBox.values.fold(0.0, (sum, record) {
+      final recordDate = _normalizeDate(DateTime.parse(record['date']));
+      if (recordDate.isAfter(normalizedFrom.subtract(const Duration(days: 1))) &&
+          recordDate.isBefore(normalizedTo) &&
+          (category == 'All' || record['type'] == category)) {
         return sum + (record['amount'] ?? 0.0);
       }
       return sum;
     });
 
-    // Store daily income in incomeDataBox
-    if (dailyIncome > 0) {
-      incomeDataBox.put(dateKey, dailyIncome);
+    if (_isDateInRange(DateTime.now(), fromDate, toDate)) {
+      totalIncome += cashierBox.values.fold(0.0, (sum, record) {
+        if ((category == 'All' || record['type'] == category)) {
+          return sum + (record['amount'] ?? 0.0);
+        }
+        return sum;
+      });
     }
+
+    return totalIncome;
   }
 
   @override
@@ -119,7 +171,7 @@ class _CashieringHomePageState extends State<CashieringHomePage> {
       body: Container(
         decoration: BoxDecoration(
           image: DecorationImage(
-            image: AssetImage('assets/images/background.jpg'),
+            image: AssetImage('assets/images/background.png'),
             fit: BoxFit.cover,
           ),
         ),
@@ -156,6 +208,7 @@ class _CashieringHomePageState extends State<CashieringHomePage> {
                 builder: (context, Box box, _) {
                   List records = box.values.toList().reversed.toList();
                   return ListView.builder(
+                    padding: EdgeInsets.all(8),
                     itemCount: records.length,
                     itemBuilder: (context, index) {
                       final record = records[index];
@@ -168,11 +221,11 @@ class _CashieringHomePageState extends State<CashieringHomePage> {
                           padding: EdgeInsets.only(right: 20),
                           child: Icon(
                             Icons.delete,
-                            color: const Color.fromARGB(255, 255, 255, 255),
+                            color: const Color.fromARGB(255, 153, 35, 35),
                           ),
                         ),
                         secondaryBackground: Container(
-                          color: const Color.fromARGB(255, 1, 139, 252),
+                          color: const Color.fromARGB(255, 153, 35, 35),
                           alignment: Alignment.centerLeft,
                           padding: EdgeInsets.only(left: 20),
                           child: Icon(Icons.edit, color: Colors.white),
@@ -189,12 +242,21 @@ class _CashieringHomePageState extends State<CashieringHomePage> {
                         onDismissed: (direction) {
                           // Handle dismissal
                         },
-                        child: ListTile(
-                          title: Text(
-                            '${record['type']} - ₱${record['amount'].toInt()}',
+                        child: Container(
+                          margin: EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+                          decoration: BoxDecoration(
+                            color: const Color.fromARGB(255, 217, 218, 223),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: const Color.fromARGB(255, 22, 22, 22)!),
                           ),
-                          subtitle: Text(
-                            DateFormat('yyyy-MM-dd HH:mm:ss').format(DateTime.parse(record['date'])),
+                          child: ListTile(
+                            title: Text(
+                              '${record['type']} - ₱${record['amount'].toInt()}',
+                              style: TextStyle(fontWeight: FontWeight.bold),
+                            ),
+                            subtitle: Text(
+                              DateFormat('MMM d, y hh:mm a').format(DateTime.parse(record['date'])),
+                            ),
                           ),
                         ),
                       );
@@ -208,7 +270,7 @@ class _CashieringHomePageState extends State<CashieringHomePage> {
       ),
       bottomNavigationBar: Container(
         height: 60,
-        color: const Color.fromARGB(255, 228, 0, 0),
+        color: const Color.fromARGB(255, 153, 35, 35),
         child: Row(
           mainAxisAlignment: MainAxisAlignment.spaceEvenly,
           children: [
@@ -233,9 +295,9 @@ class _CashieringHomePageState extends State<CashieringHomePage> {
         padding: EdgeInsets.zero,
         children: [
           Container(
-            height: 120, // Adjusted height for better fit
+            height: 120,
             decoration: BoxDecoration(
-              color: const Color.fromARGB(255, 255, 0, 0),
+              color: const Color.fromARGB(255, 153, 35, 35),
             ),
             child: Center(
               child: Text(
@@ -314,8 +376,8 @@ class _CashieringHomePageState extends State<CashieringHomePage> {
   Widget _buildButton(String text, double amount) {
     return ElevatedButton(
       style: ElevatedButton.styleFrom(
-        backgroundColor: const Color.fromARGB(255, 248, 0, 0),
-        foregroundColor: Colors.white,
+        backgroundColor: const Color.fromARGB(255, 153, 35, 35),
+        foregroundColor: const Color.fromARGB(255, 241, 239, 239),
       ),
       onPressed: () {
         _addCashierRecord(text, amount);
@@ -329,7 +391,7 @@ class _CashieringHomePageState extends State<CashieringHomePage> {
     final record = {
       'type': type,
       'amount': amount,
-      'date': DateTime.now().toIso8601String(),
+      'date': DateTime.now().toIso8601String(), // Store full datetime
     };
     cashierBox.add(record);
   }
@@ -337,16 +399,15 @@ class _CashieringHomePageState extends State<CashieringHomePage> {
   void _showIncomeDialog() {
     showModalBottomSheet(
       context: context,
-      isScrollControlled: true, // Allow the dialog to be scrollable
+      isScrollControlled: true,
       builder: (context) {
         return StatefulBuilder(
           builder: (BuildContext context, StateSetter setModalState) {
             return Container(
               padding: EdgeInsets.all(20),
-              height: MediaQuery.of(context).size.height * 0.6, // Adjusted height
+              height: MediaQuery.of(context).size.height * 0.6,
               child: Column(
                 children: [
-                  // Date Range Picker
                   Row(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
@@ -403,8 +464,6 @@ class _CashieringHomePageState extends State<CashieringHomePage> {
                       ),
                     ),
                   SizedBox(height: 20),
-
-                  // Category Dropdown
                   DropdownButton<String>(
                     value: _selectedCategory,
                     hint: Text('Select Category'),
@@ -430,12 +489,8 @@ class _CashieringHomePageState extends State<CashieringHomePage> {
                       ),
                     ),
                   SizedBox(height: 20),
-
-                  // Income Details
                   if (_fromDate != null && _toDate != null && _selectedCategory != null)
                     _buildIncomeDetails(),
-
-                  // Clear and Close Buttons
                   SizedBox(height: 20),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
@@ -469,7 +524,7 @@ class _CashieringHomePageState extends State<CashieringHomePage> {
 
   Widget _buildIncomeDetails() {
     if (_fromDate == null || _toDate == null || _selectedCategory == null) {
-      return SizedBox.shrink(); // Hide if no category is selected
+      return SizedBox.shrink();
     }
 
     double totalIncome = _calculateIncomeForRange(
@@ -493,63 +548,6 @@ class _CashieringHomePageState extends State<CashieringHomePage> {
     );
   }
 
-double _calculateIncomeForRange(
-  DateTime fromDate,
-  DateTime toDate,
-  String category,
-) {
-  double totalIncome = 0.0;
-
-  // Normalize the dates to the start of the day
-  DateTime startDate = DateTime(fromDate.year, fromDate.month, fromDate.day);
-  DateTime endDate = DateTime(toDate.year, toDate.month, toDate.day + 1); // Start of the next day
-
-  print('Calculating income from $startDate to $endDate for category: $category');
-
-  // Calculate income from cashierBox (current day's records)
-  if (startDate.isAtSameMomentAs(DateTime.now()) || 
-      (startDate.isBefore(DateTime.now()) && endDate.isAfter(DateTime.now()))) {
-    totalIncome += cashierBox.values.fold(0.0, (sum, record) {
-      if (record is Map &&
-          record.containsKey('date') &&
-          record.containsKey('amount')) {
-        DateTime recordDate = DateTime.parse(record['date']);
-        print('CashierBox Record - Date: $recordDate, Type: ${record['type']}, Amount: ${record['amount']}');
-
-        // Check if the record matches the selected category or "All"
-        if (category == 'All' || record['type'] == category) {
-          print('Including CashierBox Record: $record');
-          return sum + (record['amount'] ?? 0.0);
-        }
-      }
-      return sum;
-    });
-  }
-
-  // Calculate income from historicalRecordsBox (past records)
-  totalIncome += historicalRecordsBox.values.fold(0.0, (sum, record) {
-    if (record is Map &&
-        record.containsKey('date') &&
-        record.containsKey('amount')) {
-      DateTime recordDate = DateTime.parse(record['date']);
-      print('HistoricalRecordBox Record - Date: $recordDate, Type: ${record['type']}, Amount: ${record['amount']}');
-
-      // Check if the record is within the selected date range
-      if (recordDate.isAtSameMomentAs(startDate) || 
-          (recordDate.isAfter(startDate) && recordDate.isBefore(endDate))) {
-        // Check if the record matches the selected category or "All"
-        if (category == 'All' || record['type'] == category) {
-          print('Including HistoricalRecordBox Record: $record');
-          return sum + (record['amount'] ?? 0.0);
-        }
-      }
-    }
-    return sum;
-  });
-
-  print('Total Income: $totalIncome'); // Debug log
-  return totalIncome;
-}
   Future<bool?> _showDeleteConfirmationDialog(Map record) async {
     return showDialog<bool>(
       context: context,
